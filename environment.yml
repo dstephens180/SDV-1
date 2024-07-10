@@ -1,0 +1,24 @@
+# 1. Create an empty conda env ----
+#     conda env create -f environment.yml
+# 
+# 2. Activate the Environment
+#  - Command Palette > Python Select Interpreter
+#  - Select created environment
+#  - May need to refresh
+# 
+# 3. Trash Any Open Terminals (Open a New Terminal)
+#   
+# 4. Pip Install Requirements
+#   - pip install -r requirements.txt
+#   - In the event of any errors: Relax requirements and rerun.
+
+
+name: sdv-venv
+channels:
+  - anaconda
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.9
+  - pip
+  - pytorch

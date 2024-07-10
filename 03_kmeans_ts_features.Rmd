@@ -1,0 +1,403 @@
+---
+title: "Market Level: K-Means Time-Series Optimum Clusters"
+---
+
+YOU SHOULD RUN THIS ALL THE WAY THROUGH.
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+    echo    = FALSE,
+    message = FALSE,
+    warning = FALSE
+)
+
+library(DBI)
+library(RMariaDB)
+
+library(jsonlite)
+library(tidyjson)
+
+library(flexdashboard)
+library(shiny)
+library(shinyjs)
+library(shinyWidgets)
+library(plotly)
+library(bslib)
+
+library(tidyverse)
+library(lubridate)
+library(tidymodels)
+library(janitor)
+library(timetk)
+library(tidyquant)
+library(modeltime)
+
+library(reactable)
+library(reactablefmtr)
+
+library(mapview)
+library(leaflet)
+library(sf)
+library(tigris)
+
+library(viridis)
+
+```
+
+
+
+
+## handy-dandy function
+```{r}
+dbWriteTableMySQLFast<- function(conn, df, tbl_name) {
+  dbRemoveTable(conn, tbl_name, fail_if_missing = FALSE)
+  dbCreateTable(conn, tbl_name, fields = df)
+  
+  f <- tempfile()
+  write_csv(df, file = f, na = "NULL")
+  
+  dbWriteTable(conn, tbl_name, f, append = TRUE)
+
+  unlink(f)
+}
+```
+
+
+
+# --
+# 0.0 RAW DATA
+```{r}
+combined_listings <- read_csv("00_data/combined_listings_svr.csv")
+combined_calendar <- read_csv("00_data/track_combined_calendar_svr.csv")
+```
+
+
+
+
+# --
+# 1.0 DATA PREP
+```{r}
+listings_joined <- 
+  combined_calendar %>%
+  left_join(combined_listings, by = c("listing_id" = "unit_id")) %>%
+  drop_na(latitude)
+```
+
+
+# --
+# 2.0 KMEANS: LAT/LON BASED
+
+## Using lat/lng coords for testing
+```{r}
+selected_object_tbl <- 
+  listings_joined %>%
+  distinct(listing_id, .keep_all = T)
+
+
+selected_object_sf <- 
+  selected_object_tbl %>%
+  st_as_sf(
+    coords = c("longitude", "latitude"),
+    crs    = 4326,
+    na.fail = F
+  )
+
+
+mapview(
+  selected_object_sf, 
+  zcol = "bedrooms",
+  cex = 5,
+  color       = "white",
+  legend      = F,
+  layer.name  = "Track Listings",
+  map.types   = c("CartoDB.Positron", "CartoDB.DarkMatter"),
+  basemaps.color.shuffle = F
+)
+```
+
+
+```{r}
+### kmeans clustering - round 1 ###
+set.seed(5678)
+kmeans_obj_1 <- 
+  selected_object_sf %>%
+  st_coordinates() %>%
+  as_tibble() %>%
+  kmeans(
+    centers = nrow(selected_object_sf)/3,
+    nstart  = 100)
+
+
+geocode_kmeans_1_sf <- 
+  selected_object_sf %>%
+  mutate(cluster = kmeans_obj_1$cluster %>% factor())
+
+
+points_1 <- 
+  geocode_kmeans_1_sf %>%
+  st_coordinates() %>%
+  as_tibble()
+
+
+# nest all into tibble
+kclusts_1 <- 
+  tibble(k = 1:round(nrow(selected_object_sf)/2, 0)) %>%
+  mutate(
+    kcluster_map = map(k, ~kmeans(points_1, .x)),
+    tidied       = map(kcluster_map, tidy),
+    glanced      = map(kcluster_map, glance),
+    augmented    = map(kcluster_map, augment, points_1)
+  )
+
+clusters_1    <- kclusts_1 %>% unnest(cols = c(tidied))
+assignments_1 <- kclusts_1 %>% unnest(cols = c(augmented))
+clusterings_1 <- kclusts_1 %>% unnest(cols = c(glanced))
+
+
+# calculate diagonal line
+diagonal_line <- 
+  clusterings_1 %>%
+  mutate(min_max = case_when(
+    k == min(clusterings_1$k) ~ tot.withinss, 
+    k == max(clusterings_1$k) ~ tot.withinss, 
+    T ~ NA)) %>%
+  mutate(min_max = ts_impute_vec(min_max, period = 1)) %>%
+  rename(intercept = min_max) %>%
+  mutate(distance = intercept - tot.withinss)
+  
+
+# find optimum value
+optimum_value_1 <- 
+  as.vector(diagonal_line %>%
+  filter(distance == max(distance)) %>%
+  select(k))[[1]]
+
+
+
+### kmeans clustering - round 2 ###
+set.seed(5678)
+kclust_optimum_1 <- 
+  selected_object_sf %>%
+    st_coordinates() %>%
+    as_tibble() %>%
+    kmeans(
+      centers = optimum_value_1,
+      nstart  = 100)
+
+
+geocode_kmeans_optimum_1_sf <- 
+  selected_object_sf %>%
+  mutate(cluster = kclust_optimum_1$cluster %>% factor())
+```
+
+
+## Optimum clusters mapped, but just by location
+```{r}
+mapview(
+  geocode_kmeans_optimum_1_sf, 
+  zcol        = "cluster",
+  cex         = 5,
+  color       = "white",
+  legend      = F,
+  layer.name  = "Track Listings Grouped by Location",
+  map.types   = c("CartoDB.Positron", "CartoDB.DarkMatter"),
+  basemaps.color.shuffle = F
+)
+```
+
+
+
+
+# --
+# 2.0 KMEANS: TIME SERIES FEATURES ON (adjusted) REVPAR
+
+## Summarize by week first, and do not scale (actual RevPAR is best for analysis)
+```{r}
+date_value_tbl <-
+  listings_joined %>% 
+  select(id = listing_id, date, value = rate)
+
+
+sample_vec <- unique(date_value_tbl$id) %>% sample(100)
+```
+
+
+```{r}
+tsfeature_tbl <- 
+  date_value_tbl %>%
+  group_by(id) %>%
+  tk_tsfeatures(
+    .date_var = date,
+    .value    = value,
+    .period   = "auto",
+    .features = c("frequency", "stl_features", "entropy", "acf_features", "mean", "min", "max"),
+      .scale    = TRUE,
+      .prefix   = "ts_"
+    ) %>%
+  ungroup() %>%
+  drop_na()
+
+
+set.seed(5678)
+kmeans_prepared <- 
+  tibble(
+    cluster = tsfeature_tbl %>%
+      select(-id) %>%
+      as.matrix() %>%
+      kmeans(
+        centers = optimum_value_1, 
+        nstart  = 100
+      ) %>%
+      pluck("cluster")
+  ) %>%
+  bind_cols(tsfeature_tbl)
+
+
+
+# left join all features
+kmeans_filtered <- 
+  kmeans_prepared %>%
+  select(cluster, id) %>%
+  left_join(date_value_tbl, by = "id")
+```
+
+
+## Save to db
+```{r}
+# random words
+random_words <- c("Sunset", "Harmony", "Whisper", "Radiant", "Serenity", "Meadow", "Bliss", "Crescent", "Willow", "Echo", "Glimmer", "Luminous", "Zephyr", "Eclipse", "Cascade", "Twilight", "Breeze", "Ethereal", "Velvet", "Azure")
+
+
+
+# Create a mapping of cluster numbers to words
+cluster_to_word <- setNames(random_words, c(1:optimum_value_1))
+
+
+
+cluster_id_connected <- 
+  kmeans_prepared %>%
+  select(cluster, id) %>%
+  distinct(id, .keep_all = T) %>% 
+  mutate(cluster = cluster_to_word[as.character(cluster)])
+
+
+cluster_id_connected %>%
+  group_by(cluster) %>%
+  count()
+
+
+write_csv(cluster_id_connected, "00_data/kmeans_cluster_svr.csv")
+```
+
+
+
+
+# --
+# 3.0 PLOTTING & VISUALS
+
+## Visualize
+
+- Mean curve for each cluster
+```{r}
+kmeans_weighted_mean <- 
+  kmeans_filtered %>%
+  group_by(cluster) %>%
+  summarize_by_time(
+    date,
+    .by   = str_to_lower("day"),
+    value = mean(value, na.rm = T)
+  ) %>%
+  ungroup() %>%
+  select(cluster, date, value)
+
+
+
+kmeans_weighted_mean %>%
+  plot_time_series(
+    date,
+    value,
+    .color_var = cluster,
+    .smooth = F,
+    .title = "Mean Rate by Cluster"
+  )
+```
+
+
+
+```{r}
+cluster_id_prepared <- 
+  kmeans_prepared %>%
+  select(cluster, id) %>%
+  left_join(selected_object_tbl, by = c("id" = "listing_id"))
+
+
+cluster_id_sf <- 
+  cluster_id_prepared %>%
+  st_as_sf(
+    coords = c("longitude", "latitude"),
+    crs    = 4326,
+    na.fail = F
+  )
+
+
+
+mapview(
+  cluster_id_sf, 
+  zcol        = "cluster",
+  cex         = 5,
+  color       = "white",
+  legend      = F,
+  layer.name  = "Time Series Clusters",
+  map.types   = c("CartoDB.Positron", "CartoDB.DarkMatter"),
+  basemaps.color.shuffle = F
+)
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
